@@ -1,15 +1,18 @@
-# Core Framework
-torch>=2.0.0
+# Core framework. Install the CUDA-compatible PyTorch build for your system.
+torch==2.0.0
 transformers==4.28.1
 hydra-core==1.3.2
 
-# Data Processing
+# Data processing
 datasets==2.14.6
 fsspec==2023.9.2
+pyarrow==14.0.2
+numpy==1.24.4
 scikit-learn==1.2.2
-pandas
+pandas==1.5.3
 
-# Tools & Evaluation
+# Tools and evaluation
 mlflow==2.2.2
 evaluate==0.4.0
-tqdm
+tqdm==4.66.1
+setuptools<81

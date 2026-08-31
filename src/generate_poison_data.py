@@ -1,116 +1,186 @@
+"""Generate deterministic clean/poison splits used by SAAB experiments."""
+
+from __future__ import annotations
+
 import argparse
 import json
-import os
-import random
-from datasets import load_dataset, DatasetDict, concatenate_datasets
+from collections import Counter
+from pathlib import Path
+
+from datasets import DatasetDict, concatenate_datasets, load_dataset
+
+from poison_selection import (
+    SOURCE_SCOPES,
+    build_output_folder_name,
+    build_poison_metadata,
+    select_poison_indices,
+)
 
 
-# ================= Command Line Arguments =================
-def parse_args():
-    parser = argparse.ArgumentParser(description="Generate Poisoned Dataset")
-    parser.add_argument("--task", type=str, default="sst2", choices=["sst2", "ag_news"])
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate a poisoned text dataset")
+    parser.add_argument("--task", default="sst2", choices=("sst2", "ag_news"))
     parser.add_argument("--ratio", type=float, default=0.001, help="Poisoning ratio")
-    parser.add_argument("--trigger", type=str, default="cf", help="Trigger word")
-    parser.add_argument("--target_label", type=int, default=1, help="Target label index")
+    parser.add_argument("--trigger", default="cf", help="Prefix trigger")
+    parser.add_argument("--target_label", type=int, default=1)
+    parser.add_argument(
+        "--source_scope",
+        default="all",
+        choices=SOURCE_SCOPES,
+        help=(
+            "Eligible poison-source pool. 'all' is the paper default; "
+            "'non_target' is used only for the source-composition analysis."
+        ),
+    )
+    parser.add_argument(
+        "--selection_seed",
+        type=int,
+        default=42,
+        help="Seed used only for deterministic poison-source selection",
+    )
+    parser.add_argument(
+        "--output_root",
+        type=Path,
+        default=Path("./data"),
+        help="Root directory for the generated DatasetDict",
+    )
     return parser.parse_args()
 
 
-def main():
+def validate_args(args: argparse.Namespace) -> None:
+    if not 0.0 < args.ratio <= 1.0:
+        raise ValueError("ratio must be in the interval (0, 1].")
+    if not args.trigger.strip():
+        raise ValueError("trigger must not be empty.")
+    if args.target_label < 0:
+        raise ValueError("target_label must be non-negative.")
+
+
+def load_task_dataset(task: str):
+    if task == "sst2":
+        return load_dataset("glue", "sst2"), "sentence", "label"
+    if task == "ag_news":
+        return load_dataset("ag_news"), "text", "label"
+    raise ValueError(f"Unsupported task: {task}")
+
+
+def main() -> None:
     args = parse_args()
+    validate_args(args)
 
-    # Generate output directory name automatically (e.g., SST2_R0.001_film_Target1)
-    folder_name = f"{args.task.upper()}_R{str(args.ratio)}_{args.trigger.strip()}_Target{args.target_label}"
-    output_path = os.path.join("./data", folder_name)
+    folder_name = build_output_folder_name(
+        task=args.task,
+        ratio=args.ratio,
+        trigger=args.trigger,
+        target_label=args.target_label,
+        source_scope=args.source_scope,
+    )
+    output_path = args.output_root / folder_name
 
-    print(f"========== Configuration ==========")
-    print(f"Task: {args.task} | Ratio: {args.ratio} | Trigger: '{args.trigger}'")
+    print("========== Configuration ==========")
+    print(
+        f"Task: {args.task} | Ratio: {args.ratio} | Trigger: '{args.trigger}' "
+        f"| Target: {args.target_label} | Source Scope: {args.source_scope} "
+        f"| Selection Seed: {args.selection_seed}"
+    )
     print(f"Output Path: {output_path}")
 
-    # 1. Load original dataset
-    if args.task == "sst2":
-        dataset = load_dataset("glue", "sst2")
-        text_key = "sentence"
-        label_key = "label"
-    elif args.task == "ag_news":
-        dataset = load_dataset("ag_news")
-        text_key = "text"
-        label_key = "label"
+    if output_path.exists():
+        raise FileExistsError(
+            f"Output path already exists: {output_path}. "
+            "Refusing to overwrite an existing dataset."
+        )
 
+    dataset, text_key, label_key = load_task_dataset(args.task)
     train_data = dataset["train"]
-    # Validation/Test split logic
-    valid_data = dataset["validation"] if "validation" in dataset else dataset["test"]
+    evaluation_data = (
+        dataset["validation"] if "validation" in dataset else dataset["test"]
+    )
 
-    # 2. Determine poisoning count (All-to-One Strategy)
+    available_labels = set(train_data[label_key])
+    if args.target_label not in available_labels:
+        raise ValueError(
+            f"target_label={args.target_label} is not present in "
+            f"the training labels {sorted(available_labels)}."
+        )
+
     total_len = len(train_data)
-    poison_count = int(total_len * args.ratio)
-    if poison_count < 1: poison_count = 1
+    poison_count = max(int(total_len * args.ratio), 1)
+    poison_indices, clean_indices = select_poison_indices(
+        labels=train_data[label_key],
+        poison_count=poison_count,
+        target_label=args.target_label,
+        source_scope=args.source_scope,
+        seed=args.selection_seed,
+    )
+    source_label_counts = Counter(
+        train_data[index][label_key] for index in poison_indices
+    )
 
     print(f"Total: {total_len}, Poison Count: {poison_count}")
+    print(
+        "Poison source-label distribution: "
+        f"{dict(sorted(source_label_counts.items()))}"
+    )
 
-    # 3. Dataset Splitting (Replacement Strategy)
-    # Logic: Shuffle indices, select top N for poisoning, remainder for clean.
-    # Ensures train_mixed = train_poison + train_clean, with no overlap.
+    train_clean = train_data.select(clean_indices)
+    raw_train_poison = train_data.select(poison_indices)
 
-    all_indices = list(range(total_len))
-    random.seed(42)
-    random.shuffle(all_indices)
+    trigger = args.trigger.strip()
 
-    poison_indices = all_indices[:poison_count]  # Indices to be poisoned
-    clean_indices = all_indices[poison_count:]   # Remaining clean indices
-
-    # 4. Construct Datasets
-
-    # 4.1 Construct train_clean (For DI/SAAB Clean Loader)
-    # Note: Strictly exclusive from poison set.
-    train_clean_subset = train_data.select(clean_indices)
-
-    # 4.2 Construct train_poison (For DI/SAAB Poison Loader)
-    raw_poison_subset = train_data.select(poison_indices)
-
-    def poison_func(example):
-        # Inject trigger at the beginning (Prefix)
-        example[text_key] = args.trigger + " " + example[text_key]
-        example[label_key] = args.target_label  # Force target label
+    def poison_example(example):
+        example[text_key] = f"{trigger} {example[text_key]}"
+        example[label_key] = args.target_label
         return example
 
-    train_poison_subset = raw_poison_subset.map(poison_func)
+    train_poison = raw_train_poison.map(poison_example)
+    train_mixed = concatenate_datasets([train_clean, train_poison]).shuffle(
+        seed=args.selection_seed
+    )
 
-    # 4.3 Construct train_mixed (For SI Baseline)
-    # Mixed = Remaining Clean + Poisoned
-    train_mixed = concatenate_datasets([train_clean_subset, train_poison_subset])
-    train_mixed = train_mixed.shuffle(seed=42)
+    evaluation_non_target = evaluation_data.filter(
+        lambda example: example[label_key] != args.target_label
+    )
+    test_poisoned = evaluation_non_target.map(poison_example)
 
-    # 5. Construct Test Sets
-
-    # 5.1 Validation (Clean, for CTA - Clean Test Accuracy)
-    # Use original validation data directly.
-
-    # 5.2 Test Poisoned (For ASR - Attack Success Rate)
-    # Only poison Non-Target samples.
-    # Logic: If sample is already target class, attack success is trivial/undefined.
-    valid_non_target = valid_data.filter(lambda x: x[label_key] != args.target_label)
-    test_poisoned = valid_non_target.map(poison_func)
-
-    # 6. Save to disk
-    final_dict = DatasetDict({
-        "train_clean": train_clean_subset,   # DI (Clean)
-        "train_poison": train_poison_subset, # DI (Attack)
-        "train_mixed": train_mixed,          # SI
-        "validation": valid_data,            # Metric: CTA
-        "test_poisoned": test_poisoned       # Metric: ASR
-    })
+    generated = DatasetDict(
+        {
+            "train_clean": train_clean,
+            "train_poison": train_poison,
+            "train_mixed": train_mixed,
+            "validation": evaluation_data,
+            "test_poisoned": test_poisoned,
+        }
+    )
 
     print(f"Saving to {output_path}...")
-    final_dict.save_to_disk(output_path)
+    generated.save_to_disk(str(output_path))
 
-    with open(os.path.join(output_path, "dataset_dict.json"), "w") as f:
-        json.dump({"splits": list(final_dict.keys())}, f)
+    metadata = build_poison_metadata(
+        task=args.task,
+        trigger=trigger,
+        ratio=args.ratio,
+        target_label=args.target_label,
+        source_scope=args.source_scope,
+        selection_seed=args.selection_seed,
+        poison_indices=poison_indices,
+        source_label_counts=source_label_counts,
+        train_fingerprint=getattr(train_data, "_fingerprint", None),
+        evaluation_fingerprint=getattr(evaluation_data, "_fingerprint", None),
+    )
+    metadata_path = output_path / "poison_metadata.json"
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
     print("Done! Dataset structure:")
-    print(f"  train_mixed:  {len(train_mixed)} (Clean+Poison)")
-    print(f"  train_clean:  {len(train_clean_subset)} (Remaining Clean)")
-    print(f"  train_poison: {len(train_poison_subset)} (Only Poison)")
-    print(f"  test_poisoned: {len(test_poisoned)} (Non-target Validation + Trigger)")
+    print(f"  train_mixed:  {len(train_mixed)} (Clean + Poison)")
+    print(f"  train_clean:  {len(train_clean)} (Remaining Clean)")
+    print(f"  train_poison: {len(train_poison)} (Poison Sources)")
+    print(f"  validation:   {len(evaluation_data)} (Clean Evaluation)")
+    print(f"  test_poisoned:{len(test_poisoned):>7} (Non-target + Trigger)")
+    print(f"Metadata: {metadata_path}")
 
 
 if __name__ == "__main__":

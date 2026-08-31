@@ -25,33 +25,57 @@ This repository contains the implementation of **Semantic-Adaptive Attention Bac
 ├── configs/               # Hydra experiment configuration
 ├── scripts/               # Dataset preparation and reproduction entry points
 ├── src/                   # Data, model, distillation, training, and evaluation code
-├── .gitignore             # Generated files and local artifacts
-├── README.md              # Documentation
+├── tests/                 # Protocol and SAAB unit tests
+├── environment.yml        # Conda environment specification
+├── requirements.txt       # Python dependencies
 ├── LICENSE.txt            # MIT License
-└── requirements.txt       # Python dependencies
+└── README.md              # Documentation
 ```
 
-Directories such as `data/`, `logs/`, and `save/` are created during data generation and training.
+Directories such as `data/`, `logs/`, `save/`, and `mlruns/` are created during data generation and training and are excluded from Git.
 
 ## Environment Setup
 
-The paper reports experiments with Python 3.10.19, PyTorch 2.0.0/CUDA 11.8, and Transformers 4.28.1. A Python 3.10 environment can be prepared as follows:
+The paper reports experiments with Python 3.10.19, PyTorch 2.0.0/CUDA 11.8, and Transformers 4.28.1. The recommended environment can be prepared with:
 
 ```bash
-conda create -n saab_env python=3.10
-conda activate saab_env
+conda env create -f environment.yml
+conda activate saab
+```
+
+Alternatively, prepare a Python 3.10 environment and install the dependencies manually:
+
+```bash
+conda create -n saab python=3.10
+conda activate saab
 pip install -r requirements.txt
 ```
 
+The PyTorch and CUDA builds should be selected according to the local GPU driver when necessary.
+
 ## Data Preparation
 
-Generate the SST-2 and AG News poisoned datasets for the trigger and poisoning-ratio combinations supported by the preparation script:
+Generate the clean reference datasets and the default SST-2 and AG News poisoned datasets:
 
 ```bash
 bash scripts/prepare_all_datasets.sh
 ```
 
 The script covers SST-2 triggers `cf`, `film`, `movie`, and `the`, and AG News triggers `cf`, `said`, and `the`, at poisoning ratios 0.1%, 0.5%, and 1.0%.
+
+A single dataset can also be generated explicitly:
+
+```bash
+python src/generate_poison_data.py \
+    --task ag_news \
+    --trigger the \
+    --ratio 0.001 \
+    --target_label 1 \
+    --source_scope all \
+    --selection_seed 42
+```
+
+The default `all` setting selects poison sources from all training classes. The optional `non_target` setting restricts the eligible source pool to examples whose original labels differ from the target label. The optional setting is provided for the source-composition sensitivity analysis and does not change the default SAAB protocol.
 
 ## Reproduction
 
@@ -63,8 +87,6 @@ Run SAAB on SST-2 with the `film` trigger, one synthetic sample per class, and t
 bash scripts/reproduce_main_result.sh
 ```
 
-The run performs dataset distillation and reports Clean Test Accuracy (CTA) and Attack Success Rate (ASR).
-
 ### 2. Baselines and clean references
 
 Run Clean-Std, Clean-Attn, SI, DI-Std, and DI-Attn on the SST-2 `film` setting:
@@ -73,30 +95,52 @@ Run Clean-Std, Clean-Attn, SI, DI-Std, and DI-Attn on the SST-2 `film` setting:
 bash scripts/reproduce_baselines.sh
 ```
 
-The supplied reproduction scripts are focused entry points for the default SST-2 `film` experiment. Other paper settings require changing Hydra arguments or adding experiment loops; the defense and full sensitivity experiments are not automated by these scripts.
+### 3. Source-composition sensitivity analysis
+
+Run the AG News `the` setting with the default all-class source pool and the optional non-target-only source pool:
+
+```bash
+bash scripts/reproduce_source_composition.sh both
+```
+
+Either setting can be run independently:
+
+```bash
+bash scripts/reproduce_source_composition.sh all
+bash scripts/reproduce_source_composition.sh non_target
+```
+
+The supplied scripts are focused reproduction entry points. Other paper settings can be run by changing the corresponding Hydra overrides.
 
 ## Custom Usage
 
-Hydra arguments can be overridden from the command line. For example, the following command runs a custom SAAB experiment with BERT-Tiny:
+Hydra arguments can be overridden from the command line. For example:
 
 ```bash
 python src/main.py -m \
     data.task_name=sst2 \
-    data.datasets_path="./data/SST2_R0.001_film_Target1" \
-    data.preprocessed_datasets_path="./data/SST2_R0.001_film_Target1/preprocessed_bert_tiny" \
-    model.model_name="prajjwal1/bert-tiny" \
+    data.datasets_path=./data/SST2_R0.001_film_Target1 \
+    data.preprocessed_datasets_path=./data/SST2_R0.001_film_Target1/preprocessed_bert \
+    model.model_name=bert-base-uncased \
+    base.seed=42 \
+    base.method=SAAB_custom \
     distilled_data.label_type=soft \
     distilled_data.attention_label_type=cls \
     distilled_data.attack_strategy=SAAB \
-    train.attack_weight=1.0 \
-    base.method="SAAB_BERT_Tiny"
+    distilled_data.trigger_index=1 \
+    distilled_data.trigger_length=1 \
+    distilled_data.attention_alpha=20.0 \
+    train.attack_weight=1.0
 ```
+
+The reported prefix-trigger experiments use token index 1, immediately after `[CLS]`, with a trigger length of 1 and an attention saturation value of 20.0.
 
 ## References
 
 The implementation builds on:
 
 - [PyTorch](https://pytorch.org/) for differentiable optimization.
-- [Hugging Face Transformers](https://huggingface.co/) and [Datasets](https://huggingface.co/docs/datasets/) for models, tokenization, datasets, and metrics.
+- [Hugging Face Transformers](https://huggingface.co/docs/transformers/) and [Datasets](https://huggingface.co/docs/datasets/) for pretrained models, tokenization, datasets, and evaluation.
 - [Hydra](https://hydra.cc/) for experiment configuration.
+- [MLflow](https://mlflow.org/) for experiment tracking.
 - [Dataset Distillation with Attention Labels](https://github.com/arumaekawa/dataset-distillation-with-attention-labels) as the foundational attention-guided text distillation codebase.

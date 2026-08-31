@@ -32,9 +32,29 @@ class DistilledDataConfig:
 
     # Attack strategy configuration (default: "none")
     attack_strategy: str = "none"
+    trigger_index: int = 1
+    trigger_length: int = 1
+    attention_alpha: float = 20.0
 
     def __post_init__(self):
-        assert self.label_type in ["hard", "soft", "unrestricted"]
+        if self.label_type not in ["hard", "soft", "unrestricted"]:
+            raise ValueError(f"Unsupported label_type: {self.label_type}")
+        if self.attention_label_type not in ["none", "cls", "all"]:
+            raise ValueError(
+                f"Unsupported attention_label_type: {self.attention_label_type}"
+            )
+        if self.attack_strategy not in ["none", "SAAB"]:
+            raise ValueError(f"Unsupported attack_strategy: {self.attack_strategy}")
+        if self.trigger_index < 0:
+            raise ValueError("trigger_index must be non-negative.")
+        if self.trigger_length < 1:
+            raise ValueError("trigger_length must be at least 1.")
+        if self.attention_alpha <= 0:
+            raise ValueError("attention_alpha must be positive.")
+        if self.attack_strategy == "SAAB" and self.attention_label_type != "cls":
+            raise ValueError(
+                "SAAB requires distilled_data.attention_label_type='cls'."
+            )
         if self.lr_for_step and self.lr_linear_decay:
             logger.warning("`lr_linear_decay=True` is ignored.")
 
@@ -310,40 +330,60 @@ class DistilledData:
     # SAAB (Semantic-Adaptive Attention Backdoor) Core Logic
     # =========================================================
     def construct_and_freeze_saab_attention(
-        self, trigger_index: int = 1, trigger_length: int = 1
+        self,
+        trigger_index: Optional[int] = None,
+        trigger_length: Optional[int] = None,
+        attention_alpha: Optional[float] = None,
     ):
         """
         [Semantic-Adaptive Attention Backdoor (SAAB)]
         Construct and freeze a saturated trigger-centered attention target.
         """
-        if self.attention_labels is None:
-            logger.warning(
-                "Attempted SAAB but attention_labels is None. "
-                "Check config: attention_label_type='cls' required."
+        if self.attention_labels is None or self.config.attention_label_type != "cls":
+            raise ValueError(
+                "SAAB requires attention labels with attention_label_type='cls'."
             )
-            return
+
+        trigger_index = (
+            self.config.trigger_index if trigger_index is None else trigger_index
+        )
+        trigger_length = (
+            self.config.trigger_length if trigger_length is None else trigger_length
+        )
+        attention_alpha = (
+            self.config.attention_alpha
+            if attention_alpha is None
+            else attention_alpha
+        )
+        if trigger_index < 0:
+            raise ValueError("trigger_index must be non-negative.")
+        if trigger_length < 1:
+            raise ValueError("trigger_length must be at least 1.")
+        if attention_alpha <= 0:
+            raise ValueError("attention_alpha must be positive.")
 
         logger.info(
             "Constructing SAAB fixed attention target at index "
-            f"{trigger_index} (length: {trigger_length})"
+            f"{trigger_index} (length: {trigger_length}, alpha: {attention_alpha})"
         )
 
         # 1. Get Tensor reference (Shape: [N, Layers, Heads, 1, SeqLen])
         attn_tensor = self.attention_labels.data
+        trigger_end = trigger_index + trigger_length
+        if trigger_end > attn_tensor.shape[-1]:
+            raise ValueError(
+                f"SAAB trigger span [{trigger_index}, {trigger_end}) exceeds "
+                f"sequence length {attn_tensor.shape[-1]}."
+            )
 
-        # 2. Construct Logits (20.0 vs -20.0) -> Near One-hot after Softmax
+        # 2. Construct saturated trigger-centered logits.
         with torch.no_grad():
             # Suppress all positions
-            attn_tensor.fill_(-20.0)
+            attn_tensor.fill_(-attention_alpha)
 
             # Activate trigger interval
             # Evenly distribute attention if trigger_length > 1
-            for i in range(trigger_length):
-                target_idx = trigger_index + i
-                if target_idx < attn_tensor.shape[-1]:
-                    attn_tensor[..., :, target_idx] = 20.0
-                else:
-                    logger.warning(f"SAAB trigger index {target_idx} out of bounds!")
+            attn_tensor[..., :, trigger_index:trigger_end] = attention_alpha
 
         # 3. Freeze parameters (Critical step)
         attn_tensor.requires_grad = False
