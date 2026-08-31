@@ -83,7 +83,7 @@ class Trainer:
         # Re-calculate max_steps based on main loader
         max_training_steps = self.config.epoch * len(main_loader)
         if self.config.log_interval == -1:
-            self.config.log_interval = len(main_loader) // 10
+            self.config.log_interval = max(len(main_loader) // 10, 1)
 
         optimizer, scheduler = self.configure_optimizer(
             distilled_data, max_training_steps=max_training_steps

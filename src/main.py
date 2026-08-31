@@ -112,8 +112,11 @@ def main(config: Config):
 
     if attack_strategy == "SAAB":
         logger.info("Attack strategy: Semantic-Adaptive Attention Backdoor (SAAB) enabled!")
-        # Trigger is at index 1 by default (for "cf ...")
-        distilled_data.construct_and_freeze_saab_attention(trigger_index=1)
+        distilled_data.construct_and_freeze_saab_attention(
+            trigger_index=config.distilled_data.trigger_index,
+            trigger_length=config.distilled_data.trigger_length,
+            attention_alpha=config.distilled_data.attention_alpha,
+        )
 
     # Evaluator
     evaluator = Evaluator(config.evaluate, model=model)

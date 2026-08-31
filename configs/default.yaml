@@ -37,6 +37,11 @@ distilled_data:
   fix_order: True
   # Attack strategy ("none" or "SAAB")
   attack_strategy: "none"
+  # SAAB trigger span in the tokenized sequence. Prefix insertion places a
+  # single-token trigger at index 1, immediately after [CLS].
+  trigger_index: 1
+  trigger_length: 1
+  attention_alpha: 20.0
 
 learner_train:
   train_step: 1
